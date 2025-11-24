@@ -345,10 +345,7 @@ export default function Home() {
             </span>
             <br />
             <span className="text-sm text-zinc-500 dark:text-zinc-500">
-              owner 주소:
-            </span>
-            <span className="text-sm font-mono text-zinc-700 dark:text-zinc-300 bg-zinc-100 dark:bg-zinc-800 px-3 py-1 rounded">
-              김영욱 92212788
+              owner 주소: 0xE9960B77E242F634571A63cB8b7639eeaDd312D6
             </span>
           </div>
         </div>
