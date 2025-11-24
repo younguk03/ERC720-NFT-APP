@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { ethers } from 'ethers'
 import { connectWallet, getProvider, formatAddress } from '@/lib/web3'
 import { getContract, getContractWithSigner } from '@/lib/contract'
@@ -9,6 +9,18 @@ import { uploadMetadataToIPFS, getIPFSUrl, NFTMetadata } from '@/lib/ipfs'
 import NFTCard from '@/components/NFTCard'
 import ImageUpload from '@/components/ImageUpload'
 
+type NFTInfo = {
+  tokenId: string
+  owner: string
+  tokenURI: string
+}
+
+type DelegatedNFTInfo = NFTInfo & {
+  approvalType: 'single' | 'all'
+}
+
+type QueryMode = 'my' | 'all' | 'approved' | 'token'
+
 export default function Home() {
   const [address, setAddress] = useState<string>('')
   const [isConnecting, setIsConnecting] = useState(false)
@@ -16,14 +28,13 @@ export default function Home() {
     name: string
     symbol: string
   } | null>(null)
-  const [myNFTs, setMyNFTs] = useState<
-    Array<{
-      tokenId: string
-      owner: string
-      tokenURI: string
-    }>
-  >([])
+  const [myNFTs, setMyNFTs] = useState<NFTInfo[]>([])
+  const [allNFTs, setAllNFTs] = useState<NFTInfo[]>([])
+  const [approvedNFTs, setApprovedNFTs] = useState<DelegatedNFTInfo[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [isLoadingAllNFTs, setIsLoadingAllNFTs] = useState(false)
+  const [isLoadingApprovedNFTs, setIsLoadingApprovedNFTs] = useState(false)
+  const [isLoadingTokenQuery, setIsLoadingTokenQuery] = useState(false)
   const [mintTokenURI, setMintTokenURI] = useState('')
   const [isMinting, setIsMinting] = useState(false)
   const [balance, setBalance] = useState<bigint>(0n)
@@ -35,6 +46,23 @@ export default function Home() {
   const [nftDescription, setNftDescription] = useState('')
   const [mintMode, setMintMode] = useState<'image' | 'uri'>('image')
   const [isUploadingMetadata, setIsUploadingMetadata] = useState(false)
+  const [delegateTargets, setDelegateTargets] = useState<
+    Record<string, string>
+  >({})
+  const [delegateTransferTokenId, setDelegateTransferTokenId] = useState<
+    string | null
+  >(null)
+  const approvalLookup = useMemo(() => {
+    const map = new Map<string, DelegatedNFTInfo['approvalType']>()
+    for (const nft of approvedNFTs) {
+      map.set(nft.tokenId, nft.approvalType)
+    }
+    return map
+  }, [approvedNFTs])
+  const [activeQuery, setActiveQuery] = useState<QueryMode>('my')
+  const [tokenIdInput, setTokenIdInput] = useState('')
+  const [tokenQueryResults, setTokenQueryResults] = useState<NFTInfo[]>([])
+  const [lastQueriedTokenId, setLastQueriedTokenId] = useState('')
 
   useEffect(() => {
     checkConnection()
@@ -53,11 +81,15 @@ export default function Home() {
     if (accounts.length === 0) {
       setAddress('')
       setMyNFTs([])
+      setAllNFTs([])
+      setApprovedNFTs([])
+      setDelegateTargets({})
       setContractInfo(null)
       setBalance(0n)
     } else {
       setAddress(accounts[0])
       loadData(accounts[0])
+      loadApprovedNFTs({ targetAddress: accounts[0], skipAlert: true })
     }
   }
 
@@ -70,6 +102,7 @@ export default function Home() {
       if (accounts.length > 0) {
         setAddress(accounts[0])
         await loadData(accounts[0])
+        await loadApprovedNFTs({ targetAddress: accounts[0], skipAlert: true })
       }
     } catch (error) {
       console.error('Connection check error:', error)
@@ -82,6 +115,10 @@ export default function Home() {
       const { address: connectedAddress } = await connectWallet()
       setAddress(connectedAddress)
       await loadData(connectedAddress)
+      await loadApprovedNFTs({
+        targetAddress: connectedAddress,
+        skipAlert: true,
+      })
     } catch (error: any) {
       alert(error.message || '지갑 연결에 실패했습니다.')
     } finally {
@@ -162,11 +199,7 @@ export default function Home() {
 
       const nfts = (await Promise.all(nftPromises)).filter(
         (nft) => nft !== null
-      ) as Array<{
-        tokenId: string
-        owner: string
-        tokenURI: string
-      }>
+      ) as NFTInfo[]
 
       setMyNFTs(nfts)
     } catch (error: any) {
@@ -174,6 +207,235 @@ export default function Home() {
       alert(error.message || 'NFT 조회에 실패했습니다.')
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  const loadAllNFTs = async () => {
+    setIsLoadingAllNFTs(true)
+    try {
+      const provider = getProvider()
+      if (!provider) {
+        alert('MetaMask를 설치하고 활성화한 뒤 다시 시도해주세요.')
+        return
+      }
+
+      const contract = getContract(provider)
+      const filter = contract.filters.Transfer(null, null)
+      const events = await contract.queryFilter(filter)
+
+      const tokenIdSet = new Set<string>()
+      for (const event of events) {
+        if ('args' in event && event.args?.tokenId) {
+          tokenIdSet.add(event.args.tokenId.toString())
+        }
+      }
+
+      const nftPromises = Array.from(tokenIdSet).map(async (tokenId) => {
+        try {
+          const [owner, tokenURI] = await Promise.all([
+            contract.ownerOf(tokenId),
+            contract.tokenURI(tokenId).catch(() => ''),
+          ])
+          return { tokenId, owner, tokenURI }
+        } catch {
+          return null
+        }
+      })
+
+      const nfts = (await Promise.all(nftPromises)).filter(
+        (nft): nft is NFTInfo => nft !== null
+      )
+
+      nfts.sort((a, b) => {
+        const diff = BigInt(b.tokenId) - BigInt(a.tokenId)
+        if (diff === 0n) return 0
+        return diff > 0n ? 1 : -1
+      })
+
+      setAllNFTs(nfts)
+    } catch (error: any) {
+      console.error('Load all NFTs error:', error)
+      alert(error.message || '전체 NFT 조회에 실패했습니다.')
+    } finally {
+      setIsLoadingAllNFTs(false)
+    }
+  }
+
+  const loadApprovedNFTs = async ({
+    targetAddress,
+    skipAlert = false,
+  }: {
+    targetAddress?: string
+    skipAlert?: boolean
+  } = {}) => {
+    const userAddress = targetAddress ?? address
+    if (!userAddress) {
+      if (!skipAlert) {
+        alert('먼저 지갑을 연결해주세요.')
+      }
+      return
+    }
+
+    setIsLoadingApprovedNFTs(true)
+    try {
+      const provider = getProvider()
+      if (!provider) {
+        if (!skipAlert) {
+          alert('MetaMask를 설치하고 활성화한 뒤 다시 시도해주세요.')
+        }
+        return
+      }
+
+      const contract = getContract(provider)
+      const transferFilter = contract.filters.Transfer(null, null)
+      const events = await contract.queryFilter(transferFilter)
+
+      const tokenIdSet = new Set<string>()
+      for (const event of events) {
+        if ('args' in event && event.args?.tokenId) {
+          tokenIdSet.add(event.args.tokenId.toString())
+        }
+      }
+
+      const userAddressLower = userAddress.toLowerCase()
+      const ownerApprovalCache = new Map<string, boolean>()
+
+      const nftPromises = Array.from(tokenIdSet).map(async (tokenId) => {
+        try {
+          const [owner, tokenURI, approved] = await Promise.all([
+            contract.ownerOf(tokenId),
+            contract.tokenURI(tokenId).catch(() => ''),
+            contract.getApproved(tokenId).catch(() => ethers.ZeroAddress),
+          ])
+
+          const ownerLower = owner.toLowerCase()
+          if (approved && approved.toLowerCase() === userAddressLower) {
+            return {
+              tokenId,
+              owner,
+              tokenURI,
+              approvalType: 'single' as const,
+            }
+          }
+
+          let isOperator = ownerApprovalCache.get(ownerLower)
+          if (isOperator === undefined) {
+            try {
+              isOperator = await contract.isApprovedForAll(owner, userAddress)
+            } catch {
+              isOperator = false
+            }
+            ownerApprovalCache.set(ownerLower, Boolean(isOperator))
+          }
+
+          if (isOperator) {
+            return {
+              tokenId,
+              owner,
+              tokenURI,
+              approvalType: 'all' as const,
+            }
+          }
+
+          return null
+        } catch (error) {
+          console.error('Delegate NFT fetch error:', error)
+          return null
+        }
+      })
+
+      const delegated = (await Promise.all(nftPromises)).filter(
+        (nft): nft is DelegatedNFTInfo => nft !== null
+      )
+
+      delegated.sort((a, b) => {
+        const diff = BigInt(b.tokenId) - BigInt(a.tokenId)
+        if (diff === 0n) return 0
+        return diff > 0n ? 1 : -1
+      })
+
+      setApprovedNFTs(delegated)
+    } catch (error: any) {
+      console.error('Load approved NFTs error:', error)
+      alert(error.message || '승인된 NFT 조회에 실패했습니다.')
+    } finally {
+      setIsLoadingApprovedNFTs(false)
+    }
+  }
+
+  const fetchTokenById = async (
+    tokenId: string,
+    { suppressAlerts = false }: { suppressAlerts?: boolean } = {}
+  ) => {
+    const normalizedTokenId = tokenId.trim()
+    if (!normalizedTokenId) {
+      if (!suppressAlerts) {
+        alert('조회할 Token ID를 입력해주세요.')
+      }
+      return
+    }
+
+    try {
+      setIsLoadingTokenQuery(true)
+      const provider = getProvider()
+      if (!provider) {
+        if (!suppressAlerts) {
+          alert('MetaMask를 설치하고 활성화한 뒤 다시 시도해주세요.')
+        }
+        return
+      }
+
+      const contract = getContract(provider)
+      const [owner, tokenURI] = await Promise.all([
+        contract.ownerOf(normalizedTokenId),
+        contract.tokenURI(normalizedTokenId),
+      ])
+
+      setTokenQueryResults([{ tokenId: normalizedTokenId, owner, tokenURI }])
+      setLastQueriedTokenId(normalizedTokenId)
+    } catch (error: any) {
+      console.error('Query token error:', error)
+      if (!suppressAlerts) {
+        alert(error.message || '토큰 조회에 실패했습니다.')
+      }
+    } finally {
+      setIsLoadingTokenQuery(false)
+    }
+  }
+
+  const handleQueryToken = async () => {
+    await fetchTokenById(tokenIdInput, { suppressAlerts: false })
+  }
+
+  const handleSelectQuery = async (mode: QueryMode) => {
+    setActiveQuery(mode)
+
+    if ((mode === 'my' || mode === 'approved') && !address) {
+      return
+    }
+
+    if (mode === 'my') {
+      await loadAllMyNFTs()
+    } else if (mode === 'all') {
+      await loadAllNFTs()
+    } else if (mode === 'approved') {
+      await loadApprovedNFTs()
+    }
+  }
+
+  const refreshActiveQuery = async () => {
+    if (activeQuery === 'my') {
+      if (address) {
+        await loadAllMyNFTs()
+      }
+    } else if (activeQuery === 'all') {
+      await loadAllNFTs()
+    } else if (activeQuery === 'approved') {
+      if (address) {
+        await loadApprovedNFTs({ skipAlert: true })
+      }
+    } else if (activeQuery === 'token' && lastQueriedTokenId) {
+      await fetchTokenById(lastQueriedTokenId, { suppressAlerts: true })
     }
   }
 
@@ -230,6 +492,7 @@ export default function Home() {
       setNftName('')
       setNftDescription('')
       await loadData(address)
+      await loadAllNFTs()
     } catch (error: any) {
       console.error('Mint error:', error)
       alert(error.message || '민팅에 실패했습니다.')
@@ -261,6 +524,7 @@ export default function Home() {
       alert('민팅이 완료되었습니다!')
       setMintTokenURI('')
       await loadData(address)
+      await loadAllNFTs()
     } catch (error: any) {
       console.error('Mint error:', error)
       alert(error.message || '민팅에 실패했습니다.')
@@ -269,45 +533,298 @@ export default function Home() {
     }
   }
 
-  const handleQueryToken = async () => {
-    const tokenId = prompt('조회할 Token ID를 입력하세요:')
-    if (!tokenId) return
-
-    try {
-      setIsLoading(true)
-      const provider = getProvider()
-      if (!provider) return
-
-      const contract = getContract(provider)
-      const [owner, tokenURI] = await Promise.all([
-        contract.ownerOf(tokenId),
-        contract.tokenURI(tokenId),
-      ])
-
-      const existingIndex = myNFTs.findIndex((nft) => nft.tokenId === tokenId)
-      const nftData = { tokenId, owner, tokenURI }
-
-      if (existingIndex >= 0) {
-        setMyNFTs((prev) => {
-          const updated = [...prev]
-          updated[existingIndex] = nftData
-          return updated
-        })
-      } else {
-        setMyNFTs((prev) => [...prev, nftData])
-      }
-    } catch (error: any) {
-      console.error('Query token error:', error)
-      alert(error.message || '토큰 조회에 실패했습니다.')
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
   const handleRefresh = async () => {
     if (address) {
       await loadData(address)
+      await loadApprovedNFTs({ skipAlert: true })
     }
+    await refreshActiveQuery()
+  }
+
+  const handleDelegateInputChange = (tokenId: string, value: string) => {
+    setDelegateTargets((prev) => ({
+      ...prev,
+      [tokenId]: value,
+    }))
+  }
+
+  const handleDelegateTransfer = async (nft: DelegatedNFTInfo) => {
+    if (!address) {
+      alert('먼저 지갑을 연결해주세요.')
+      return
+    }
+
+    if (typeof window === 'undefined' || !window.ethereum) {
+      alert('MetaMask를 설치하고 활성화한 뒤 다시 시도해주세요.')
+      return
+    }
+
+    const to = (delegateTargets[nft.tokenId] || '').trim()
+    if (!to) {
+      alert('전송 받을 주소를 입력해주세요.')
+      return
+    }
+
+    if (!ethers.isAddress(to)) {
+      alert('유효한 이더리움 주소를 입력해주세요.')
+      return
+    }
+
+    try {
+      setDelegateTransferTokenId(nft.tokenId)
+      const provider = new ethers.BrowserProvider(window.ethereum)
+      const signer = await provider.getSigner()
+      const contract = getContractWithSigner(signer)
+
+      const tx = await contract.safeTransferFrom(nft.owner, to, nft.tokenId)
+      await tx.wait()
+      alert('대리전송이 완료되었습니다!')
+      setDelegateTargets((prev) => ({
+        ...prev,
+        [nft.tokenId]: '',
+      }))
+      await loadApprovedNFTs({ skipAlert: true })
+      await loadAllNFTs()
+    } catch (error: any) {
+      console.error('Delegate transfer error:', error)
+      alert(error.message || '대리전송에 실패했습니다.')
+    } finally {
+      setDelegateTransferTokenId(null)
+    }
+  }
+
+  const renderBadges = (nft: NFTInfo) => {
+    const badges: Array<{ label: string; style: string }> = []
+    if (address && nft.owner.toLowerCase() === address.toLowerCase()) {
+      badges.push({
+        label: '내 소유',
+        style: 'bg-indigo-600 text-white dark:bg-indigo-500 dark:text-white',
+      })
+    }
+
+    const approvalType = approvalLookup.get(nft.tokenId)
+    if (approvalType) {
+      badges.push({
+        label: approvalType === 'all' ? '전체 승인' : '토큰 승인',
+        style: 'bg-amber-500 text-white dark:bg-amber-400 dark:text-zinc-900',
+      })
+    }
+
+    if (badges.length === 0) return null
+
+    return (
+      <div className="absolute top-2 left-2 flex flex-wrap gap-2">
+        {badges.map((badge) => (
+          <span
+            key={`${nft.tokenId}-${badge.label}`}
+            className={`px-2 py-1 text-xs font-semibold rounded-full shadow-sm ${badge.style}`}
+          >
+            {badge.label}
+          </span>
+        ))}
+      </div>
+    )
+  }
+
+  const renderQueryResults = () => {
+    if (activeQuery === 'my') {
+      if (!address) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            지갑을 연결하면 보유 중인 NFT를 조회할 수 있습니다.
+          </div>
+        )
+      }
+
+      if (isLoading) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            내 NFT 데이터를 불러오는 중입니다...
+          </div>
+        )
+      }
+
+      if (myNFTs.length === 0) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            조회된 NFT가 없습니다. 민팅하거나 Token ID로 조회해보세요.
+          </div>
+        )
+      }
+
+      return (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {myNFTs.map((nft) => (
+            <div key={`my-${nft.tokenId}`} className="relative">
+              {renderBadges(nft)}
+              <NFTCard
+                tokenId={nft.tokenId}
+                owner={nft.owner}
+                tokenURI={nft.tokenURI}
+                currentAddress={address || ''}
+                onTransfer={handleRefresh}
+                onRefresh={handleRefresh}
+              />
+            </div>
+          ))}
+        </div>
+      )
+    }
+
+    if (activeQuery === 'all') {
+      if (isLoadingAllNFTs) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            전체 NFT 데이터를 불러오는 중입니다...
+          </div>
+        )
+      }
+
+      if (allNFTs.length === 0) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            아직 조회된 NFT가 없습니다. 버튼을 눌러 최신 데이터를 가져오세요.
+          </div>
+        )
+      }
+
+      return (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {allNFTs.map((nft) => (
+            <div key={`all-${nft.tokenId}`} className="relative">
+              {renderBadges(nft)}
+              <NFTCard
+                tokenId={nft.tokenId}
+                owner={nft.owner}
+                tokenURI={nft.tokenURI}
+                currentAddress={address || ''}
+                onTransfer={handleRefresh}
+                onRefresh={handleRefresh}
+              />
+            </div>
+          ))}
+        </div>
+      )
+    }
+
+    if (activeQuery === 'approved') {
+      if (!address) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            승인을 받으려면 먼저 지갑을 연결해주세요.
+          </div>
+        )
+      }
+
+      if (isLoadingApprovedNFTs) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            승인된 NFT 정보를 불러오는 중입니다...
+          </div>
+        )
+      }
+
+      if (approvedNFTs.length === 0) {
+        return (
+          <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+            현재 대리전송이 가능한 NFT가 없습니다. 소유자로부터 승인을 받은 뒤
+            다시 조회하세요.
+          </div>
+        )
+      }
+
+      return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {approvedNFTs.map((nft) => (
+            <div
+              key={`approved-${nft.tokenId}`}
+              className="border rounded-lg p-4 bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800"
+            >
+              <div className="mb-3 space-y-1">
+                <p className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">
+                  Token ID: {nft.tokenId}
+                </p>
+                <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                  소유자: {formatAddress(nft.owner)}
+                </p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-500 break-all">
+                  URI:{' '}
+                  {nft.tokenURI.length > 60
+                    ? `${nft.tokenURI.slice(0, 60)}...`
+                    : nft.tokenURI}
+                </p>
+                <span
+                  className={`inline-flex items-center px-2 py-1 text-xs font-medium rounded ${
+                    nft.approvalType === 'single'
+                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200'
+                      : 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200'
+                  }`}
+                >
+                  {nft.approvalType === 'single'
+                    ? '단일 토큰 승인'
+                    : '전체 소유자 승인'}
+                </span>
+              </div>
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  value={delegateTargets[nft.tokenId] || ''}
+                  onChange={(e) =>
+                    handleDelegateInputChange(nft.tokenId, e.target.value)
+                  }
+                  placeholder="전송 받을 주소 입력"
+                  className="w-full px-3 py-2 text-sm border rounded dark:bg-zinc-800 dark:border-zinc-700 dark:text-zinc-50"
+                />
+                <button
+                  onClick={() => handleDelegateTransfer(nft)}
+                  disabled={delegateTransferTokenId === nft.tokenId}
+                  className="w-full px-4 py-2 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 transition-colors"
+                >
+                  {delegateTransferTokenId === nft.tokenId
+                    ? '대리전송 중...'
+                    : '대리전송 실행'}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )
+    }
+
+    // token query
+    if (isLoadingTokenQuery) {
+      return (
+        <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+          Token ID를 통해 NFT를 조회하는 중입니다...
+        </div>
+      )
+    }
+
+    if (tokenQueryResults.length === 0) {
+      return (
+        <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
+          조회할 Token ID를 입력하고 조회 버튼을 눌러주세요.
+        </div>
+      )
+    }
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {tokenQueryResults.map((nft) => (
+          <div key={`token-${nft.tokenId}`} className="relative">
+            {renderBadges(nft)}
+            <NFTCard
+              tokenId={nft.tokenId}
+              owner={nft.owner}
+              tokenURI={nft.tokenURI}
+              currentAddress={address || ''}
+              onTransfer={handleRefresh}
+              onRefresh={handleRefresh}
+            />
+          </div>
+        ))}
+      </div>
+    )
   }
 
   return (
@@ -336,16 +853,20 @@ export default function Home() {
               Etherscan에서 보기
             </a>
           </div>
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className='mt-2'>
+            <span className="text-sm text-zinc-500 dark:text-zinc-500">
+              owner 주소:
+            </span>
+            <span className="text-sm font-mono text-zinc-700 dark:text-zinc-300 bg-zinc-100 dark:bg-zinc-800 px-3 py-1 rounded">
+              0x9f19f2781e0d66a75ec260c4bf44ac2ab0faabf8
+            </span>
+          </div>
+          <div className='mt-2'>
             <span className="text-sm text-zinc-500 dark:text-zinc-500">
               이름, 학번:
             </span>
             <span className="text-sm font-mono text-zinc-700 dark:text-zinc-300 bg-zinc-100 dark:bg-zinc-800 px-3 py-1 rounded">
-              김영욱 92212788
-            </span>
-            <br />
-            <span className="text-sm text-zinc-500 dark:text-zinc-500">
-              owner 주소: 0xE9960B77E242F634571A63cB8b7639eeaDd312D6
+              김영욱, 92212788
             </span>
           </div>
         </div>
@@ -522,63 +1043,87 @@ export default function Home() {
           </div>
         )}
 
-        {/* NFT 조회 및 관리 섹션 */}
-        {address && (
-          <div className="bg-white dark:bg-zinc-900 rounded-lg p-6 mb-6 border border-zinc-200 dark:border-zinc-800">
-            <div className="flex items-center justify-between mb-4">
+        {/* 조회 메뉴 */}
+        <div className="bg-white dark:bg-zinc-900 rounded-lg p-6 mb-6 border border-zinc-200 dark:border-zinc-800">
+          <div className="flex items-center justify-between flex-wrap gap-3 mb-4">
+            <div>
               <h2 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-50">
-                NFT 조회 및 관리
+                NFT 조회 & 대리전송
               </h2>
-              <div className="flex gap-2">
-                <button
-                  onClick={loadAllMyNFTs}
-                  disabled={isLoading}
-                  className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors text-sm font-medium"
-                >
-                  내 NFT 모두 조회
-                </button>
-                <button
-                  onClick={handleQueryToken}
-                  disabled={isLoading}
-                  className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors text-sm font-medium"
-                >
-                  Token ID로 조회
-                </button>
-                <button
-                  onClick={handleRefresh}
-                  disabled={isLoading}
-                  className="px-4 py-2 bg-zinc-600 text-white rounded-lg hover:bg-zinc-700 disabled:opacity-50 transition-colors text-sm font-medium"
-                >
-                  새로고침
-                </button>
-              </div>
+              <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1">
+                원하는 조회 메뉴를 선택하면 아래에 바로 결과가 표시됩니다.
+              </p>
             </div>
-
-            {isLoading ? (
-              <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
-                로딩 중...
-              </div>
-            ) : myNFTs.length === 0 ? (
-              <div className="text-center py-8 text-zinc-600 dark:text-zinc-400">
-                조회된 NFT가 없습니다. Token ID로 조회해보세요.
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {myNFTs.map((nft) => (
-                  <NFTCard
-                    key={nft.tokenId}
-                    tokenId={nft.tokenId}
-                    owner={nft.owner}
-                    tokenURI={nft.tokenURI}
-                    currentAddress={address}
-                    onTransfer={handleRefresh}
-                    onRefresh={handleRefresh}
-                  />
-                ))}
-              </div>
-            )}
+            <button
+              onClick={handleRefresh}
+              className="px-4 py-2 text-sm font-medium bg-zinc-100 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200 rounded-lg hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+            >
+              전체 새로고침
+            </button>
           </div>
-        )}
+
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { key: 'my', label: '내 NFT 조회' },
+                { key: 'all', label: '전체 NFT 조회' },
+                { key: 'approved', label: '승인된 NFT 조회' },
+                { key: 'token', label: 'Token ID로 조회' },
+              ] as Array<{ key: QueryMode; label: string }>
+            ).map((button) => {
+              const isActive = activeQuery === button.key
+              const isBusy =
+                (button.key === 'my' && isLoading) ||
+                (button.key === 'all' && isLoadingAllNFTs) ||
+                (button.key === 'approved' && isLoadingApprovedNFTs) ||
+                (button.key === 'token' && isLoadingTokenQuery)
+
+              const requiresWallet =
+                (button.key === 'my' || button.key === 'approved') && !address
+
+              return (
+                <button
+                  key={button.key}
+                  onClick={() => handleSelectQuery(button.key)}
+                  disabled={isBusy}
+                  title={
+                    requiresWallet
+                      ? '지갑을 연결하면 이 메뉴를 사용할 수 있습니다.'
+                      : undefined
+                  }
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors border ${
+                    isActive
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 border-transparent hover:bg-zinc-200 dark:hover:bg-zinc-700'
+                  } ${requiresWallet ? 'opacity-60 cursor-not-allowed' : ''}`}
+                >
+                  {isBusy ? '조회 중...' : button.label}
+                </button>
+              )
+            })}
+          </div>
+
+          {activeQuery === 'token' && (
+            <div className="mt-4 flex flex-col md:flex-row gap-2">
+              <input
+                type="text"
+                value={tokenIdInput}
+                onChange={(e) => setTokenIdInput(e.target.value)}
+                placeholder="조회할 Token ID를 입력하세요"
+                className="flex-1 px-4 py-2 border rounded-lg dark:bg-zinc-800 dark:border-zinc-700 dark:text-zinc-50"
+              />
+              <button
+                onClick={handleQueryToken}
+                disabled={isLoadingTokenQuery}
+                className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors text-sm font-medium"
+              >
+                {isLoadingTokenQuery ? '조회 중...' : 'Token 조회'}
+              </button>
+            </div>
+          )}
+
+          <div className="mt-6">{renderQueryResults()}</div>
+        </div>
 
         {/* 안내 섹션 */}
         <div className="bg-blue-50 dark:bg-blue-900/20 rounded-lg p-6 border border-blue-200 dark:border-blue-800">
@@ -599,8 +1144,16 @@ export default function Home() {
               IPFS에 업로드하고 NFT로 민팅하세요
             </li>
             <li>
-              • <strong>NFT 조회:</strong> "내 NFT 모두 조회" 버튼으로 소유한
-              모든 NFT를 조회할 수 있습니다
+              • <strong>NFT 조회:</strong> 조회 메뉴에서 '내 NFT 조회' 또는
+              '전체 NFT 조회'를 선택해 보유/전체 NFT를 확인하세요
+            </li>
+            <li>
+              • <strong>Token 검색:</strong> 'Token ID로 조회' 메뉴에서 조회할
+              Token ID를 입력하고 결과를 확인하세요
+            </li>
+            <li>
+              • <strong>승인 대리전송:</strong> 소유자가 승인한 NFT는 "승인 NFT
+              조회" 메뉴에서 확인 후 원하는 주소로 대리전송할 수 있습니다
             </li>
             <li>
               • <strong>NFT 관리:</strong> 소유한 NFT는 전송 및 승인 기능을
